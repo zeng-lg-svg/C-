@@ -10,6 +10,7 @@
 #include "CServer.h"
 #include "utils.h"
 #include <vector>
+#include <unordered_set>
 
 using namespace std;
 
@@ -197,6 +198,11 @@ void LogicSystem::LoginHandler(shared_ptr<CSession> session, const short &msg_id
 		//ƴ���û�ip��Ӧ��key
 		auto lock_key = LOCK_PREFIX + uid_str;
 		auto identifier = RedisMgr::GetInstance()->acquireLock(lock_key, LOCK_TIME_OUT, ACQUIRE_TIME_OUT);
+		if (identifier.empty()) {
+			rtvalue = Json::Value(Json::objectValue);
+			rtvalue["error"] = ErrorCodes::LOGIN_LOCK_FAILED;
+			return;
+		}
 		//����defer����
 		Defer defer2([this, identifier, lock_key]() {
 			RedisMgr::GetInstance()->releaseLock(lock_key, identifier);
@@ -514,6 +520,19 @@ void LogicSystem::DealChatTextMsg(std::shared_ptr<CSession> session, const short
 		session->Send(return_str, ID_TEXT_CHAT_MSG_RSP);
 	});
 
+    if (uid <= 0 || uid != session->GetUserId() || touid <= 0 || thread_id <= 0 ||
+        !arrays.isArray() || arrays.empty()) {
+        return;
+    }
+    std::unordered_set<std::string> seen_ids;
+    for (const auto& chat : chat_datas) {
+        const auto& id = chat->unique_id;
+        if (id.empty() || id.size() > 64 || !seen_ids.insert(id).second) return;
+        for (unsigned char ch : id) {
+            if (ch < 0x20 || ch > 0x7e) return;
+        }
+    }
+
 	bool saved = MysqlMgr::GetInstance()->AddChatMsg(chat_datas);
 
 	if (!saved) {
@@ -524,6 +543,10 @@ void LogicSystem::DealChatTextMsg(std::shared_ptr<CSession> session, const short
 	rtvalue["error"] = ErrorCodes::Success;
 
 
+	Json::Value notify_value = rtvalue;
+	notify_value["chat_datas"] = Json::Value(Json::arrayValue);
+	bool has_new = false;
+
 	for (const auto& chat_data : chat_datas) {
 		Json::Value  chat_msg;
 		chat_msg["message_id"] = chat_data->message_id;
@@ -532,7 +555,12 @@ void LogicSystem::DealChatTextMsg(std::shared_ptr<CSession> session, const short
 		chat_msg["status"] = chat_data->status;
 		chat_msg["chat_time"] = chat_data->chat_time;
 		rtvalue["chat_datas"].append(chat_msg);
+		if (chat_data->newly_inserted) {
+			notify_value["chat_datas"].append(chat_msg);
+			has_new = true;
+		}
 	}
+	if (!has_new) return;
 
 	
 	//��ѯredis ����touid��Ӧ��server ip
@@ -551,7 +579,7 @@ void LogicSystem::DealChatTextMsg(std::shared_ptr<CSession> session, const short
 		auto session = UserMgr::GetInstance()->GetSession(touid);
 		if (session) {
 			//���ڴ�����ֱ�ӷ���֪ͨ�Է�
-			std::string return_str = rtvalue.toStyledString();
+			std::string return_str = notify_value.toStyledString();
 			session->Send(return_str, ID_NOTIFY_TEXT_CHAT_MSG_REQ);
 		}
 
@@ -564,6 +592,7 @@ void LogicSystem::DealChatTextMsg(std::shared_ptr<CSession> session, const short
 	text_msg_req.set_touid(touid);
 	text_msg_req.set_thread_id(thread_id);
 	for (const auto& chat_data : chat_datas) {
+		if (!chat_data->newly_inserted) continue;
 		auto *text_msg = text_msg_req.add_textmsgs();
 		text_msg->set_unique_id(chat_data->unique_id);
 		text_msg->set_msgcontent(chat_data->content);
@@ -573,7 +602,7 @@ void LogicSystem::DealChatTextMsg(std::shared_ptr<CSession> session, const short
 
 
 	//����֪ͨ todo...
-	ChatGrpcClient::GetInstance()->NotifyTextChatMsg(to_ip_value, text_msg_req, rtvalue);
+	ChatGrpcClient::GetInstance()->NotifyTextChatMsg(to_ip_value, text_msg_req, notify_value);
 }
 
 void LogicSystem::HeartBeatHandler(std::shared_ptr<CSession> session, const short& msg_id, const string& msg_data) {

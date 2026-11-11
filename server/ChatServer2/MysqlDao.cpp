@@ -1,5 +1,6 @@
 #include "MysqlDao.h"
 #include "ConfigMgr.h"
+#include <stdexcept>
 
 MysqlDao::MysqlDao()
 {
@@ -871,63 +872,75 @@ std::shared_ptr<PageResult> MysqlDao::LoadChatMsg(int thread_id, int last_messag
 
 
 bool MysqlDao::AddChatMsg(std::vector<std::shared_ptr<ChatMessage>>& chat_datas) {
-	auto con = pool_->getConnection();
-	if (!con) {
-		return false;
-	}
-	Defer defer([this, &con]() {
-		pool_->returnConnection(std::move(con));
-		});
-	auto& conn = con->_con;
+    auto con = pool_->getConnection();
+    if (!con) return false;
 
+    Defer defer([this, &con]() {
+        if (!con) return;
+        try {
+            con->_con->setAutoCommit(true);
+        } catch (...) {
+            con.reset();
+            return;
+        }
+        pool_->returnConnection(std::move(con));
+    });
+    auto& conn = con->_con;
 
-	try {
-		//关闭自动提交，以手动管理事务
-		conn->setAutoCommit(false);
-		auto pstmt = std::unique_ptr<sql::PreparedStatement>(
-			conn->prepareStatement(
-				"INSERT INTO chat_message "
-				"(thread_id, sender_id, recv_id, content, created_at, updated_at, status) "
-				"VALUES (?, ?, ?, ?, ?, ?, ?)"
-			)
-		);
+    try {
+        conn->setAutoCommit(false);
+        auto insert = std::unique_ptr<sql::PreparedStatement>(conn->prepareStatement(
+            "INSERT INTO chat_message "
+            "(thread_id, sender_id, recv_id, content, created_at, updated_at, status, client_msg_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"));
+        auto lookup = std::unique_ptr<sql::PreparedStatement>(conn->prepareStatement(
+            "SELECT message_id, thread_id, recv_id, content, created_at, status "
+            "FROM chat_message WHERE sender_id = ? AND client_msg_id = ? FOR UPDATE"));
+        auto last_id = std::unique_ptr<sql::Statement>(conn->createStatement());
 
-		for (auto& msg : chat_datas) {
-			// 普通字段
-			pstmt->setUInt64(1, msg->thread_id);
-			pstmt->setUInt64(2, msg->sender_id);
-			pstmt->setUInt64(3, msg->recv_id);
-			pstmt->setString(4, msg->content);
+        for (auto& msg : chat_datas) {
+            msg->newly_inserted = false;
+            insert->setUInt64(1, msg->thread_id);
+            insert->setUInt64(2, msg->sender_id);
+            insert->setUInt64(3, msg->recv_id);
+            insert->setString(4, msg->content);
+            insert->setString(5, msg->chat_time);
+            insert->setString(6, msg->chat_time);
+            insert->setInt(7, msg->status);
+            insert->setString(8, msg->unique_id);
 
-			pstmt->setString(5, msg->chat_time);  // created_at
-			pstmt->setString(6, msg->chat_time);  // updated_at
+            try {
+                insert->executeUpdate();
+            } catch (const sql::SQLException& e) {
+                if (e.getErrorCode() != 1062) throw;
+                lookup->setUInt64(1, msg->sender_id);
+                lookup->setString(2, msg->unique_id);
+                auto old = std::unique_ptr<sql::ResultSet>(lookup->executeQuery());
+                if (!old->next()) throw std::runtime_error("duplicate key without matching message");
+                if (old->getUInt64("thread_id") != static_cast<uint64_t>(msg->thread_id) ||
+                    old->getUInt64("recv_id") != static_cast<uint64_t>(msg->recv_id) ||
+                    std::string(old->getString("content")) != msg->content) {
+                    throw std::runtime_error("message id reused with different content");
+                }
+                msg->message_id = old->getUInt64("message_id");
+                msg->chat_time = old->getString("created_at");
+                msg->status = old->getInt("status");
+                continue;
+            }
 
-			pstmt->setInt(7, msg->status);
-			pstmt->executeUpdate();
-
-			// 2. 取 LAST_INSERT_ID()
-			std::unique_ptr<sql::Statement> keyStmt(
-				conn->createStatement()
-			);
-			std::unique_ptr<sql::ResultSet> rs(
-				keyStmt->executeQuery("SELECT LAST_INSERT_ID()")
-			);
-			if (rs->next()) {
-				msg->message_id = rs->getUInt64(1);
-			}
-			else {
-				continue;
-			}
-		}
-
-		conn->commit();
-		return true;
-	}
-	catch (sql::SQLException& e) {
-		std::cerr << "SQLException: " << e.what() << std::endl;
-		conn->rollback();
-		return false;
-	}
-	return true;
-
+            auto rs = std::unique_ptr<sql::ResultSet>(last_id->executeQuery("SELECT LAST_INSERT_ID()"));
+            if (!rs->next()) throw std::runtime_error("missing inserted message id");
+            msg->message_id = rs->getUInt64(1);
+            msg->newly_inserted = true;
+        }
+        conn->commit();
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "AddChatMsg failed: " << e.what() << std::endl;
+        try { conn->rollback(); } catch (...) { con.reset(); }
+        return false;
+    } catch (...) {
+        try { conn->rollback(); } catch (...) { con.reset(); }
+        return false;
+    }
 }

@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <boost/asio.hpp>
+#include <stdexcept>
 #include "StatusServiceImpl.h"
 void RunServer() {
 	auto & cfg = ConfigMgr::Inst();
@@ -30,6 +31,11 @@ void RunServer() {
 
 	// 构建并启动gRPC服务器
 	std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
+	if (!server) {
+		throw std::runtime_error(
+			"StatusServer 启动失败，无法监听 " + server_address
+		);
+	}
 	std::cout << "Server listening on " << server_address << std::endl;
 
 	// 创建Boost.Asio的io_context

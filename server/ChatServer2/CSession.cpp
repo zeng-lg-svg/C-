@@ -1,6 +1,7 @@
 #include "CSession.h"
 #include "CServer.h"
 #include <iostream>
+#include <cstdint>
 #include <sstream>
 #include <json/json.h>
 #include <json/value.h>
@@ -170,7 +171,7 @@ void CSession::AsyncReadHead(int total_len)
 				_server->ClearSession(_session_id);
 				return;
 			}
-			short msg_len = 0;
+			std::uint16_t msg_len = 0;
 			memcpy(&msg_len, _recv_head_node->_data + HEAD_ID_LEN, HEAD_DATA_LEN);
 			//网络字节序转化为本地字节序
 			msg_len = boost::asio::detail::socket_ops::network_to_host_short(msg_len);
@@ -179,7 +180,12 @@ void CSession::AsyncReadHead(int total_len)
 			//id非法
 			if (msg_len > MAX_LENGTH) {
 				std::cout << "invalid data length is " << msg_len << endl;
-				_server->ClearSession(_session_id);
+				Close();
+				if (_user_uid > 0) {
+					DealExceptionSession();
+				} else {
+					_server->ClearSession(_session_id);
+				}
 				return;
 			}
 

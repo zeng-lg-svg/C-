@@ -18,6 +18,7 @@ enum ErrorCodes {
 	CREATE_CHAT_FAILED = 1012, //��������ʧ��
 	LOAD_CHAT_FAILED = 1013, //��������ʧ��
 	CHAT_SAVE_FAILED = 1101,  // 消息保存失败
+	LOGIN_LOCK_FAILED = 1102,
 };
 
 

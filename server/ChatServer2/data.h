@@ -47,6 +47,7 @@ struct ChatMessage {
 	std::string content;
 	std::string chat_time;
 	int status;
+	bool newly_inserted = false;
 };
 
 // 查询结果结构，增加next_cursor字段
