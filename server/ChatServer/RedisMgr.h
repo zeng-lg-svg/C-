@@ -277,6 +277,8 @@ class RedisMgr: public Singleton<RedisMgr>,
 public:
 	~RedisMgr();
 	bool Get(const std::string &key, std::string& value);
+	bool PublishOnlineSession(const std::string& uid, const std::string& server_name, const std::string& session_id);
+	bool ClearOnlineSessionIfMatch(const std::string& uid, const std::string& session_id);
 	bool Set(const std::string &key, const std::string &value);
 	bool LPush(const std::string &key, const std::string &value);
 	bool LPop(const std::string &key, std::string& value);

@@ -31,12 +31,12 @@ std::string& CSession::GetSessionId() {
 
 void CSession::SetUserId(int uid)
 {
-	_user_uid = uid;
+	_user_uid.store(uid);
 }
 
 int CSession::GetUserId()
 {
-	return _user_uid;
+	return _user_uid.load();
 }
 
 void CSession::Start(){
@@ -78,9 +78,16 @@ void CSession::Send(char* msg, short max_length, short msgid) {
 }
 
 void CSession::Close() {
-	std::lock_guard<std::mutex> lock(_session_mtx);
-	_socket.close();
-	_b_close = true;
+    std::lock_guard<std::mutex> lock(_session_mtx);
+    if (_b_close) return;
+    _b_close = true;
+    boost::system::error_code ignored;
+    _socket.close(ignored);
+}
+
+bool CSession::IsClosed() {
+    std::lock_guard<std::mutex> lock(_session_mtx);
+    return _b_close;
 }
 
 std::shared_ptr<CSession>CSession::SharedSelf() {
@@ -103,7 +110,7 @@ void CSession::AsyncReadBody(int total_len)
 				std::cout << "read length not match, read [" << bytes_transfered << "] , total ["
 					<< total_len<<"]" << endl;
 				Close();
-				_server->ClearSession(_session_id);
+				DealExceptionSession();
 				return;
 			}
 
@@ -146,7 +153,7 @@ void CSession::AsyncReadHead(int total_len)
 				std::cout << "read length not match, read [" << bytes_transfered << "] , total ["
 					<< HEAD_TOTAL_LEN << "]" << endl;
 				Close();
-				_server->ClearSession(_session_id);
+				DealExceptionSession();
 				return;
 			}
 
@@ -168,7 +175,8 @@ void CSession::AsyncReadHead(int total_len)
 			//id非法
 			if (msg_id > MAX_LENGTH) {
 				std::cout << "invalid msg_id is " << msg_id << endl;
-				_server->ClearSession(_session_id);
+				Close();
+				DealExceptionSession();
 				return;
 			}
 			std::uint16_t msg_len = 0;
@@ -181,11 +189,7 @@ void CSession::AsyncReadHead(int total_len)
 			if (msg_len > MAX_LENGTH) {
 				std::cout << "invalid data length is " << msg_len << endl;
 				Close();
-				if (_user_uid > 0) {
-					DealExceptionSession();
-				} else {
-					_server->ClearSession(_session_id);
-				}
+				DealExceptionSession();
 				return;
 			}
 
@@ -290,34 +294,24 @@ void CSession::UpdateHeartbeat()
 	_last_heartbeat = now;
 }
 
-void CSession::DealExceptionSession()
-{
-	auto self = shared_from_this();
-	//加锁清除session
-	auto uid_str = std::to_string(_user_uid);
-	auto lock_key = LOCK_PREFIX + uid_str;
-	auto identifier = RedisMgr::GetInstance()->acquireLock(lock_key, LOCK_TIME_OUT, ACQUIRE_TIME_OUT);
-	Defer defer([identifier, lock_key, self, this]() {
-		_server->ClearSession(_session_id);
-		RedisMgr::GetInstance()->releaseLock(lock_key, identifier);
-		});
+// 多个断开入口可能同时触发，用原子标志避免重复投递清理。
+void CSession::DealExceptionSession() {
+    if (_cleanup_queued.exchange(true)) return;
+    auto self = shared_from_this();
+    auto logic = LogicSystem::GetInstance();
+    // 停止阶段无法入队时先等待执行器结束，再同步尝试清理。
+    if (!logic->PostSessionCleanup(self)) {
+        logic->Stop();
+        PerformCleanup();
+    }
+}
 
-	if (identifier.empty()) {
-		return;
-	}
-	std::string redis_session_id = "";
-	auto bsuccess = RedisMgr::GetInstance()->Get(USER_SESSION_PREFIX + uid_str, redis_session_id);
-	if (!bsuccess) {
-		return;
-	}
-
-	if (redis_session_id != _session_id) {
-		//说明有客户在其他服务器异地登录了
-		return;
-	}
-
-	RedisMgr::GetInstance()->Del(USER_SESSION_PREFIX + uid_str);
-	//清除用户登录信息
-	RedisMgr::GetInstance()->Del(USERIPPREFIX + uid_str);
+// 按会话 ID 条件删除在线状态，避免旧连接删除新连接的数据。
+void CSession::PerformCleanup() {
+    const auto uid = _user_uid.load();
+    if (uid > 0 && !RedisMgr::GetInstance()->ClearOnlineSessionIfMatch(std::to_string(uid), _session_id)) {
+        std::cerr << "Session cleanup failed; Redis online state may remain" << std::endl;
+    }
+    _server->ClearSession(_session_id);
 }
 

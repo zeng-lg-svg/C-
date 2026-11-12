@@ -78,6 +78,38 @@ bool RedisMgr::Set(const std::string &key, const std::string &value){
 	return true;
 }
 
+// 一条 MSET 同时更新节点和会话 ID，避免两次写入之间出现半成品。
+bool RedisMgr::PublishOnlineSession(const std::string& uid, const std::string& server_name, const std::string& session_id) {
+    auto connect = _con_pool->getConnection();
+    if (!connect) return false;
+    Defer defer([this, &connect]() { _con_pool->returnConnection(connect); });
+    const auto ip_key = std::string(USERIPPREFIX) + uid;
+    const auto session_key = std::string(USER_SESSION_PREFIX) + uid;
+    auto reply = static_cast<redisReply*>(redisCommand(connect, "MSET %s %s %s %s",
+        ip_key.c_str(), server_name.c_str(), session_key.c_str(), session_id.c_str()));
+    if (!reply) return false;
+    bool ok = reply->type == REDIS_REPLY_STATUS && reply->str && std::string(reply->str) == "OK";
+    freeReplyObject(reply);
+    return ok;
+}
+
+// 在 Redis 内原子比较会话 ID，只删除仍属于当前连接的在线状态。
+bool RedisMgr::ClearOnlineSessionIfMatch(const std::string& uid, const std::string& session_id) {
+    auto connect = _con_pool->getConnection();
+    if (!connect) return false;
+    Defer defer([this, &connect]() { _con_pool->returnConnection(connect); });
+    const auto ip_key = std::string(USERIPPREFIX) + uid;
+    const auto session_key = std::string(USER_SESSION_PREFIX) + uid;
+    const char* script = "if redis.call('get', KEYS[1]) == ARGV[1] then "
+        "return redis.call('del', KEYS[1], KEYS[2]) else return 0 end";
+    auto reply = static_cast<redisReply*>(redisCommand(connect, "EVAL %s 2 %s %s %s",
+        script, session_key.c_str(), ip_key.c_str(), session_id.c_str()));
+    if (!reply) return false;
+    bool ok = reply->type == REDIS_REPLY_INTEGER;
+    freeReplyObject(reply);
+    return ok;
+}
+
 bool RedisMgr::LPush(const std::string &key, const std::string &value)
 {
 	auto connect = _con_pool->getConnection();

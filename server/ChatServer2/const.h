@@ -19,6 +19,7 @@ enum ErrorCodes {
 	LOAD_CHAT_FAILED = 1013, //��������ʧ��
 	CHAT_SAVE_FAILED = 1101,  // 消息保存失败
 	LOGIN_LOCK_FAILED = 1102,
+	LOGIN_ONLINE_STATE_FAILED = 1103, // 登录时在线状态写入失败
 };
 
 

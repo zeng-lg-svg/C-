@@ -12,6 +12,7 @@
 #include <json/reader.h>
 #include <unordered_map>
 #include "data.h"
+#include "ShardedExecutor.h"
 
 class CServer;
 typedef  function<void(shared_ptr<CSession>, const short &msg_id, const string &msg_data)> FunCallBack;
@@ -21,10 +22,12 @@ class LogicSystem:public Singleton<LogicSystem>
 public:
 	~LogicSystem();
 	void PostMsgToQue(shared_ptr < LogicNode> msg);
+	bool PostSessionCleanup(std::shared_ptr<CSession> session);
+	void Stop();
 	void SetServer(std::shared_ptr<CServer> pserver);
 private:
 	LogicSystem();
-	void DealMsg();
+	void ProcessMessage(std::shared_ptr<LogicNode> msg);
 	void RegisterCallBacks();
 	void LoginHandler(shared_ptr<CSession> session, const short &msg_id, const string &msg_data);
 	void SearchInfo(std::shared_ptr<CSession> session, const short& msg_id, const string& msg_data);
@@ -47,11 +50,7 @@ private:
 		int& nextLastId);
 	void CreatePrivateChat(std::shared_ptr<CSession> session, const short& msg_id, const string& msg_data);
 	void LoadChatMsg(std::shared_ptr<CSession> session, const short& msg_id, const string& msg_data);
-	std::thread _worker_thread;
-	std::queue<shared_ptr<LogicNode>> _msg_que;
-	std::mutex _mutex;
-	std::condition_variable _consume;
-	bool _b_stop;
+	ShardedExecutor _executor;
 	std::map<short, FunCallBack> _fun_callbacks;
 	std::shared_ptr<CServer> _p_server;
 };

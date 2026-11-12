@@ -70,6 +70,8 @@ int main()
 
 		grpc_server_thread.join();
 		pointer_server->StopTimer();
+		// 停止网络生产者后排空业务任务，再执行后续 Redis 清理。
+		LogicSystem::GetInstance()->Stop();
 		return 0;
 	}
 	catch (std::exception& e) {

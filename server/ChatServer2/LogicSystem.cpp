@@ -14,71 +14,37 @@
 
 using namespace std;
 
-LogicSystem::LogicSystem():_b_stop(false), _p_server(nullptr){
-	RegisterCallBacks();
-	_worker_thread = std::thread (&LogicSystem::DealMsg, this);
+LogicSystem::LogicSystem(): _executor(2), _p_server(nullptr) {
+    RegisterCallBacks();
 }
 
-LogicSystem::~LogicSystem(){
-	_b_stop = true;
-	_consume.notify_one();
-	_worker_thread.join();
+LogicSystem::~LogicSystem() { Stop(); }
+
+void LogicSystem::Stop() { _executor.shutdown(); }
+
+// 消息按会话 ID 分片；过载或停止时关闭连接并尝试安排清理。
+void LogicSystem::PostMsgToQue(shared_ptr<LogicNode> msg) {
+    if (!msg || !msg->_session) return;
+    auto session = msg->_session;
+    if (!_executor.post(session->GetSessionId(), [this, msg] { ProcessMessage(msg); })) {
+        session->Close();
+        session->DealExceptionSession();
+    }
 }
 
-void LogicSystem::PostMsgToQue(shared_ptr < LogicNode> msg) {
-	std::unique_lock<std::mutex> unique_lk(_mutex);
-	_msg_que.push(msg);
-	//��0��Ϊ1����֪ͨ�ź�
-	if (_msg_que.size() == 1) {
-		unique_lk.unlock();
-		_consume.notify_one();
-	}
+// 清理与该会话的业务任务使用同一个分片，避免相互并发。
+bool LogicSystem::PostSessionCleanup(std::shared_ptr<CSession> session) {
+    return _executor.postCritical(session->GetSessionId(), [session] { session->PerformCleanup(); });
 }
 
+void LogicSystem::SetServer(std::shared_ptr<CServer> pserver) { _p_server = pserver; }
 
-void LogicSystem::SetServer(std::shared_ptr<CServer> pserver) {
-	_p_server = pserver;
-}
-
-
-void LogicSystem::DealMsg() {
-	for (;;) {
-		std::unique_lock<std::mutex> unique_lk(_mutex);
-		//�ж϶���Ϊ�������������������ȴ������ͷ���
-		while (_msg_que.empty() && !_b_stop) {
-			_consume.wait(unique_lk);
-		}
-
-		//�ж��Ƿ�Ϊ�ر�״̬���������߼�ִ��������˳�ѭ��
-		if (_b_stop ) {
-			while (!_msg_que.empty()) {
-				auto msg_node = _msg_que.front();
-				cout << "recv_msg id  is " << msg_node->_recvnode->_msg_id << endl;
-				auto call_back_iter = _fun_callbacks.find(msg_node->_recvnode->_msg_id);
-				if (call_back_iter == _fun_callbacks.end()) {
-					_msg_que.pop();
-					continue;
-				}
-				call_back_iter->second(msg_node->_session, msg_node->_recvnode->_msg_id,
-					std::string(msg_node->_recvnode->_data, msg_node->_recvnode->_cur_len));
-				_msg_que.pop();
-			}
-			break;
-		}
-
-		//���û��ͣ������˵��������������
-		auto msg_node = _msg_que.front();
-		cout << "recv_msg id  is " << msg_node->_recvnode->_msg_id << endl;
-		auto call_back_iter = _fun_callbacks.find(msg_node->_recvnode->_msg_id);
-		if (call_back_iter == _fun_callbacks.end()) {
-			_msg_que.pop();
-			std::cout << "msg id [" << msg_node->_recvnode->_msg_id << "] handler not found" << std::endl;
-			continue;
-		}
-		call_back_iter->second(msg_node->_session, msg_node->_recvnode->_msg_id, 
-			std::string(msg_node->_recvnode->_data, msg_node->_recvnode->_cur_len));
-		_msg_que.pop();
-	}
+void LogicSystem::ProcessMessage(std::shared_ptr<LogicNode> msg_node) {
+    if (msg_node->_session->IsClosed()) return;
+    auto handler = _fun_callbacks.find(msg_node->_recvnode->_msg_id);
+    if (handler == _fun_callbacks.end()) return;
+    handler->second(msg_node->_session, msg_node->_recvnode->_msg_id,
+        std::string(msg_node->_recvnode->_data, msg_node->_recvnode->_cur_len));
 }
 
 void LogicSystem::RegisterCallBacks() {
@@ -209,6 +175,8 @@ void LogicSystem::LoginHandler(shared_ptr<CSession> session, const short &msg_id
 			});
 		//�˴��жϸ��û��Ƿ��ڱ𴦻��߱���������¼
 
+		if (session->IsClosed()) return;
+
 		std::string uid_ip_value = "";
 		auto uid_ip_key = USERIPPREFIX + uid_str;
 		bool b_ip = RedisMgr::GetInstance()->Get(uid_ip_key, uid_ip_value);
@@ -240,15 +208,17 @@ void LogicSystem::LoginHandler(shared_ptr<CSession> session, const short &msg_id
 		}
 
 		//session���û�uid
-		session->SetUserId(uid);
-		//Ϊ�û����õ�¼ip server������
-		std::string  ipkey = USERIPPREFIX + uid_str;
-		RedisMgr::GetInstance()->Set(ipkey, server_name);
-		//uid��session�󶨹���,�����Ժ����˲���
-		UserMgr::GetInstance()->SetUserSession(uid, session);
-		std::string  uid_session_key = USER_SESSION_PREFIX + uid_str;
-		RedisMgr::GetInstance()->Set(uid_session_key, session->GetSessionId());
-
+        // 原子写入节点和会话 ID；失败时尝试清理可能已写入的状态。
+        if (!RedisMgr::GetInstance()->PublishOnlineSession(uid_str, server_name, session->GetSessionId())) {
+            if (!RedisMgr::GetInstance()->ClearOnlineSessionIfMatch(uid_str, session->GetSessionId())) {
+                std::cerr << "Unable to reconcile online state after login failure" << std::endl;
+            }
+            rtvalue = Json::Value(Json::objectValue);
+            rtvalue["error"] = ErrorCodes::LOGIN_ONLINE_STATE_FAILED;
+            return;
+        }
+        session->SetUserId(uid);
+        UserMgr::GetInstance()->SetUserSession(uid, session);
 	}
 
 	return;
